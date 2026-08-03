@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	sfconfig "github.com/snowflakedb/gosnowflake/v2/internal/config"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	sfconfig "github.com/snowflakedb/gosnowflake/v2/internal/config"
 )
 
 func TestGetTokenFromResponseFail(t *testing.T) {
@@ -58,6 +60,97 @@ func TestBuildResponse(t *testing.T) {
 	respStr := string(bytes[:])
 	if !strings.Contains(respStr, "Your identity was confirmed and propagated to Snowflake Go.\nYou can close this window now and go back where you started from.") {
 		t.Fatalf("failed to build response")
+	}
+}
+
+type acceptNotifyingListener struct {
+	net.Listener
+	accepted chan<- struct{}
+}
+
+func (l acceptNotifyingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		select {
+		case l.accepted <- struct{}{}:
+		default:
+		}
+	}
+	return conn, err
+}
+
+func TestWaitForSamlResponseAcceptsCallbackAfterIdleConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assertNilF(t, err)
+	accepted := make(chan struct{}, 1)
+	notifyingListener := acceptNotifyingListener{Listener: listener, accepted: accepted}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	type result struct {
+		token string
+		err   error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		token, err := waitForSamlResponse(ctx, notifyingListener, "Go")
+		resultChan <- result{token: token, err: err}
+	}()
+
+	idleConn, err := net.Dial("tcp", listener.Addr().String())
+	assertNilF(t, err)
+	defer idleConn.Close()
+	select {
+	case <-accepted:
+	case <-ctx.Done():
+		t.Fatal("idle connection was not accepted")
+	}
+
+	client := &http.Client{Timeout: time.Second}
+	response, err := client.Get("http://" + listener.Addr().String() + "/?token=test%2Btoken")
+	assertNilF(t, err)
+	defer response.Body.Close()
+	assertEqualE(t, response.StatusCode, http.StatusOK)
+
+	select {
+	case got := <-resultChan:
+		assertNilF(t, got.err)
+		assertEqualE(t, got.token, "test%2Btoken")
+	case <-ctx.Done():
+		t.Fatal("real callback was blocked by the idle connection")
+	}
+}
+
+func TestWaitForSamlResponseStopsOnContextCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assertNilF(t, err)
+	accepted := make(chan struct{}, 1)
+	notifyingListener := acceptNotifyingListener{Listener: listener, accepted: accepted}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resultChan := make(chan error, 1)
+	go func() {
+		_, err := waitForSamlResponse(ctx, notifyingListener, "Go")
+		resultChan <- err
+	}()
+
+	idleConn, err := net.Dial("tcp", listener.Addr().String())
+	assertNilF(t, err)
+	defer idleConn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("idle connection was not accepted")
+	}
+
+	cancel()
+	select {
+	case err := <-resultChan:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener did not stop after context cancellation")
 	}
 }
 
@@ -138,6 +231,21 @@ func TestAuthenticationTimeout(t *testing.T) {
 	assertEqualE(t, err.Error(), "authentication timed out", err.Error())
 }
 
+func TestExternalBrowserAuthContextError(t *testing.T) {
+	timeoutCtx, cancelTimeout := context.WithTimeoutCause(context.Background(), 0, errExternalBrowserAuthTimeout)
+	defer cancelTimeout()
+	<-timeoutCtx.Done()
+	if !errors.Is(externalBrowserAuthContextError(timeoutCtx), errExternalBrowserAuthTimeout) {
+		t.Fatal("external-browser timeout cause was not preserved")
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !errors.Is(externalBrowserAuthContextError(canceledCtx), context.Canceled) {
+		t.Fatal("caller cancellation was not preserved")
+	}
+}
+
 func Test_createLocalTCPListener(t *testing.T) {
 	listener, err := createLocalTCPListener(0)
 	if err != nil {
@@ -149,6 +257,33 @@ func Test_createLocalTCPListener(t *testing.T) {
 
 	// Close the listener after the test.
 	defer listener.Close()
+}
+
+func TestConfiguredExternalBrowserCallbackPort(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   string
+		want    int
+		wantErr bool
+	}{
+		{name: "unset uses an ephemeral port"},
+		{name: "zero uses an ephemeral port", value: "0"},
+		{name: "pinned port", value: "3037", want: 3037},
+		{name: "negative port", value: "-1", wantErr: true},
+		{name: "port too large", value: "65536", wantErr: true},
+		{name: "non-numeric port", value: "not-a-port", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(externalBrowserCallbackPortEnv, test.value)
+			got, err := configuredExternalBrowserCallbackPort()
+			if test.wantErr {
+				assertNotNilF(t, err)
+				return
+			}
+			assertNilF(t, err)
+			assertEqualE(t, got, test.want)
+		})
+	}
 }
 
 func TestUnitGetLoginURL(t *testing.T) {

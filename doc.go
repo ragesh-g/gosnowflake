@@ -1172,6 +1172,10 @@ or using a Config structure with following ExternalBrowserTimeout specified:
 		ExternalBrowserTimeout: 240 * time.Second, // Requires time.Duration
 	}
 
+In a development container or remote environment, set SF_AUTH_SOCKET_PORT to pin the localhost callback port and forward
+the same port before starting authentication. If SF_AUTH_SOCKET_PORT is unset or 0, the driver continues to select an
+available ephemeral port.
+
 # Executing Multiple Statements in One Call
 
 This feature is available in version 1.3.8 or later of the driver.
