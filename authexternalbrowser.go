@@ -7,17 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	errors2 "github.com/snowflakedb/gosnowflake/v2/internal/errors"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pkg/browser"
+	errors2 "github.com/snowflakedb/gosnowflake/v2/internal/errors"
 )
 
 const (
@@ -29,7 +29,11 @@ You can close this window now and go back where you started from.
 </body></html>`
 
 	bufSize = 8192
+
+	externalBrowserCallbackPortEnv = "SF_AUTH_SOCKET_PORT"
 )
+
+var errExternalBrowserAuthTimeout = errors.New("authentication timed out")
 
 // Builds a response to show to the user after successfully
 // getting a response from Snowflake.
@@ -50,9 +54,9 @@ func buildResponse(body string) (bytes.Buffer, error) {
 	return b, err
 }
 
-// This opens a socket that listens on all available unicast
-// and any anycast IP addresses locally. By specifying "0", we are
-// able to bind to a free port.
+// This opens a socket that listens on all available unicast and anycast IP
+// addresses locally. Port 0 selects a free ephemeral port; a fixed port allows
+// container users to establish forwarding before authentication starts.
 func createLocalTCPListener(port int) (*net.TCPListener, error) {
 	logger.Debugf("creating local TCP listener on port %v", port)
 	allAddressesListener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%v", port))
@@ -78,6 +82,18 @@ func createLocalTCPListener(port int) (*net.TCPListener, error) {
 	}
 
 	return tcpListener, nil
+}
+
+func configuredExternalBrowserCallbackPort() (int, error) {
+	value := os.Getenv(externalBrowserCallbackPortEnv)
+	if value == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil || port < 0 || port > 65535 {
+		return 0, fmt.Errorf("%s must be an integer between 0 and 65535, got %q", externalBrowserCallbackPortEnv, value)
+	}
+	return port, nil
 }
 
 // Opens a browser window (or new tab) with the configured login Url.
@@ -214,19 +230,32 @@ type authenticateByExternalBrowserResult struct {
 
 func authenticateByExternalBrowser(ctx context.Context, sr *snowflakeRestful, authenticator string, application string,
 	account string, user string, externalBrowserTimeout time.Duration, disableConsoleLogin ConfigBool) ([]byte, []byte, error) {
+	authCtx, cancel := context.WithTimeoutCause(ctx, externalBrowserTimeout, errExternalBrowserAuthTimeout)
+	defer cancel()
+
 	resultChan := make(chan authenticateByExternalBrowserResult, 1)
 	go GoroutineWrapper(
-		ctx,
+		authCtx,
 		func() {
-			resultChan <- doAuthenticateByExternalBrowser(ctx, sr, authenticator, application, account, user, disableConsoleLogin)
+			resultChan <- doAuthenticateByExternalBrowser(authCtx, sr, authenticator, application, account, user, disableConsoleLogin)
 		},
 	)
 	select {
-	case <-time.After(externalBrowserTimeout):
-		return nil, nil, errors.New("authentication timed out")
+	case <-authCtx.Done():
+		return nil, nil, externalBrowserAuthContextError(authCtx)
 	case result := <-resultChan:
+		if authCtx.Err() != nil && errors.Is(result.err, authCtx.Err()) {
+			return nil, nil, externalBrowserAuthContextError(authCtx)
+		}
 		return result.escapedSamlResponse, result.proofKey, result.err
 	}
+}
+
+func externalBrowserAuthContextError(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), errExternalBrowserAuthTimeout) {
+		return errExternalBrowserAuthTimeout
+	}
+	return context.Cause(ctx)
 }
 
 // Authentication by an external browser takes place via the following:
@@ -239,13 +268,17 @@ func authenticateByExternalBrowser(ctx context.Context, sr *snowflakeRestful, au
 //   - Snowflake directs the user back to the driver
 //   - authenticate is complete!
 func doAuthenticateByExternalBrowser(ctx context.Context, sr *snowflakeRestful, authenticator string, application string, account string, user string, disableConsoleLogin ConfigBool) authenticateByExternalBrowserResult {
-	l, err := createLocalTCPListener(0)
+	configuredPort, err := configuredExternalBrowserCallbackPort()
+	if err != nil {
+		return authenticateByExternalBrowserResult{nil, nil, err}
+	}
+	l, err := createLocalTCPListener(configuredPort)
 	if err != nil {
 		return authenticateByExternalBrowserResult{nil, nil, err}
 	}
 	defer func() {
-		if err = l.Close(); err != nil {
-			logger.Errorf("error while closing TCP listener for external browser (%v). %v", l.Addr().String(), err)
+		if closeErr := l.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			logger.Errorf("error while closing TCP listener for external browser (%v). %v", l.Addr().String(), closeErr)
 		}
 	}()
 
@@ -269,68 +302,9 @@ func doAuthenticateByExternalBrowser(ctx context.Context, sr *snowflakeRestful, 
 		return authenticateByExternalBrowserResult{nil, nil, err}
 	}
 
-	encodedSamlResponseChan := make(chan string)
-	errChan := make(chan error)
-
-	var encodedSamlResponse string
-	var errFromGoroutine error
-	conn, err := l.Accept()
+	encodedSamlResponse, err := waitForSamlResponse(ctx, l, application)
 	if err != nil {
-		logger.WithContext(ctx).Errorf("unable to accept connection. err: %v", err)
-		log.Fatal(err)
-	}
-	go func(c net.Conn) {
-		var buf bytes.Buffer
-		total := 0
-		encodedSamlResponse := ""
-		var errAccept error
-		for {
-			b := make([]byte, bufSize)
-			n, err := c.Read(b)
-			if err != nil {
-				if err != io.EOF {
-					logger.WithContext(ctx).Infof("error reading from socket. err: %v", err)
-					errAccept = &SnowflakeError{
-						Number:      ErrFailedToGetExternalBrowserResponse,
-						SQLState:    SQLStateConnectionRejected,
-						Message:     errors2.ErrMsgFailedToGetExternalBrowserResponse,
-						MessageArgs: []any{err},
-					}
-				}
-				break
-			}
-			total += n
-			buf.Write(b)
-			if n < bufSize {
-				// We successfully read all data
-				s := string(buf.Bytes()[:total])
-				encodedSamlResponse, errAccept = getTokenFromResponse(s)
-				break
-			}
-			buf.Grow(bufSize)
-		}
-		if encodedSamlResponse != "" {
-			body := fmt.Sprintf(samlSuccessHTML, application)
-			httpResponse, err := buildResponse(body)
-			if err != nil && errAccept == nil {
-				errAccept = err
-			}
-			if _, err = c.Write(httpResponse.Bytes()); err != nil && errAccept == nil {
-				errAccept = err
-			}
-		}
-		if err := c.Close(); err != nil {
-			logger.Warnf("error while closing browser connection. %v", err)
-		}
-		encodedSamlResponseChan <- encodedSamlResponse
-		errChan <- errAccept
-	}(conn)
-
-	encodedSamlResponse = <-encodedSamlResponseChan
-	errFromGoroutine = <-errChan
-
-	if errFromGoroutine != nil {
-		return authenticateByExternalBrowserResult{nil, nil, errFromGoroutine}
+		return authenticateByExternalBrowserResult{nil, nil, err}
 	}
 
 	escapedSamlResponse, err := url.QueryUnescape(encodedSamlResponse)
@@ -339,6 +313,82 @@ func doAuthenticateByExternalBrowser(ctx context.Context, sr *snowflakeRestful, 
 		return authenticateByExternalBrowserResult{nil, nil, err}
 	}
 	return authenticateByExternalBrowserResult{[]byte(escapedSamlResponse), []byte(proofKey), nil}
+}
+
+func waitForSamlResponse(ctx context.Context, l net.Listener, application string) (string, error) {
+	encodedChan := make(chan string, 1)
+	errChan := make(chan error, 1)
+
+	server := &http.Server{
+		ReadHeaderTimeout: 2 * time.Minute,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			encoded, ok := encodedTokenFromRequest(r)
+			if !ok {
+				http.Error(w, "invalid external-browser callback", http.StatusBadRequest)
+				return
+			}
+
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, fmt.Sprintf(samlSuccessHTML, application)); err != nil {
+				logger.WithContext(ctx).Debugf("failed to write external-browser success response: %v", err)
+			}
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				logger.WithContext(ctx).Debugf("failed to flush external-browser success response: %v", err)
+			}
+
+			select {
+			case encodedChan <- encoded:
+			default:
+			}
+		}),
+	}
+	defer func() {
+		_ = server.Close()
+	}()
+
+	go func() {
+		if err := server.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			select {
+			case errChan <- &SnowflakeError{
+				Number:      ErrFailedToGetExternalBrowserResponse,
+				SQLState:    SQLStateConnectionRejected,
+				Message:     errors2.ErrMsgFailedToGetExternalBrowserResponse,
+				MessageArgs: []any{err},
+			}:
+			default:
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case encoded := <-encodedChan:
+		return encoded, nil
+	case err := <-errChan:
+		return "", err
+	}
+}
+
+// encodedTokenFromRequest returns the token without URL-decoding it. The caller
+// performs exactly one QueryUnescape after the callback has been selected.
+func encodedTokenFromRequest(r *http.Request) (string, bool) {
+	if r.Method != http.MethodGet || r.URL.Path != "/" {
+		return "", false
+	}
+	for _, field := range strings.Split(r.URL.RawQuery, "&") {
+		name, value, found := strings.Cut(field, "=")
+		if !found || value == "" {
+			continue
+		}
+		decodedName, err := url.QueryUnescape(name)
+		if err == nil && decodedName == "token" {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 type samlResponseProvider interface {
